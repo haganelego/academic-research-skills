@@ -99,6 +99,35 @@ Before finalizing the report, run the Writing Quality Check checklist (see `acad
 - Remove throat-clearing openers (e.g., "In the realm of...", "It's important to note that...")
 - Check em dash usage (≤3 per report)
 
+## Temporal Integrity Iron Rule (v3.9.4)
+
+Before writing any sentence that:
+
+- Cites a document with a publication year via <!--ref:slug-->
+- States that one event led to / was enabled by / superseded / followed another
+- Uses present-tense or deictic framing ("currently", "now", "the most recent",
+  "the latest", "new", "recently", "last year", "nowadays")
+- Compares two versions of the same standard or document
+
+You MUST:
+
+1. Identify the date or date range of every entity in the claim (cited document,
+   referenced event, comparator version) from `phase2_investigation/timeline.yaml`
+   when available, or from corpus `year` field as a fallback (year-only interval).
+2. verify the cited document existed BEFORE the event it is being used to evidence
+   (unless the research output is explicitly forward-looking about a forthcoming
+   version, in which case explicitly note this).
+3. For "A enabled B" / "A caused B" / "A led to B" framing, verify the date of A
+   is before the date of B.
+4. For "most recent" / "current" / "the latest" framing, anchor the claim to a
+   specific date or version identifier ("as of YYYY-MM-DD, ..." or "the YYYY
+   edition, ..."), not a deictic word.
+5. If the dates required to verify the claim are absent from `timeline.yaml` and
+   `literature_corpus[]`, either hedge ("appears to", "is reported as") or do
+   NOT write the claim.
+
+You may not rely on linguistic plausibility for temporal claims. Temporal claims are arithmetic, not stylistic.
+
 ## Writing Style Guidelines
 
 Reference: `references/apa7_style_guide.md`
@@ -289,8 +318,24 @@ Canonical example (single manifest with one MNC and one claim-level NC):
 
 Three firm rules:
 
-- **R-L3-2-A (one-shot pre-commitment):** Emit exactly ONE manifest entry per compiler invocation, BEFORE the first prose block. No later mutation, no append, no re-emission within the same invocation. Drafting that introduces a claim not in the manifest produces a `claim_drifts[]` entry with `drift_kind=EMITTED_NOT_INTENDED` downstream — that detection is the design intent (drift is surfaced, not silenced). The manifest is the pre-commitment artifact the audit diffs against; rewriting it mid-draft would hide the signal.
-- **R-L3-2-B (no audit responsibility):** The compiler emits manifests; it does NOT detect drift, re-judge supported / unsupported, or read other manifests. The §"Manifest cross-reference (D6)" set-diff lives in `claim_ref_alignment_audit_agent.md`. Mirrors the v3.6.7 partial-inversion discipline: narrative-side emits, audit-side reads. Standalone-mode runs (the previous section's self-gate path) still emit a manifest — the audit agent is the pipeline-mode consumer, but the manifest itself is mode-agnostic; the orchestrator drops it when no downstream audit runs.
-- **R-L3-2-C (no frontmatter reading):** Generate `claim_text`, `intended_evidence_kind`, `planned_refs`, and any `negative_constraints[].rule` values from the corpus + prompt context already provided. You MUST NOT read entry frontmatter to discover candidate claims — the same partial-inversion rule that gates anchor selection in v3.7.3 R-L3-1-C. The orchestrator allocates a fresh `manifest_id` per invocation (M-INV-4); never copy a `manifest_id` from a sibling manifest.
+- **R-CIM-A (one-shot pre-commitment):** Emit exactly ONE manifest entry per compiler invocation, BEFORE the first prose block. No later mutation, no append, no re-emission within the same invocation. Drafting that introduces a claim not in the manifest produces a `claim_drifts[]` entry with `drift_kind=EMITTED_NOT_INTENDED` downstream — that detection is the design intent (drift is surfaced, not silenced). The manifest is the pre-commitment artifact the audit diffs against; rewriting it mid-draft would hide the signal.
+- **R-CIM-B (no audit responsibility):** The compiler emits manifests; it does NOT detect drift, re-judge supported / unsupported, or read other manifests. The §"Manifest cross-reference (D6)" set-diff lives in `claim_ref_alignment_audit_agent.md`. Mirrors the v3.6.7 partial-inversion discipline: narrative-side emits, audit-side reads. Standalone-mode runs (the previous section's self-gate path) still emit a manifest — the audit agent is the pipeline-mode consumer, but the manifest itself is mode-agnostic; the orchestrator drops it when no downstream audit runs.
+- **R-CIM-C (no frontmatter reading):** Generate `claim_text`, `intended_evidence_kind`, `planned_refs`, and any `negative_constraints[].rule` values from the corpus + prompt context already provided. You MUST NOT read entry frontmatter to discover candidate claims — the same partial-inversion rule that gates anchor selection in v3.7.3 R-L3-1-C. The orchestrator allocates a fresh `manifest_id` per invocation (M-INV-4); never copy a `manifest_id` from a sibling manifest.
 
 The compiler's job still ends at emission. The audit agent reads the manifest downstream and runs the manifest set-diff, constraint-set assembly (§4 step 3), and drift / constraint-violation routing. Manifest-side mutation by this compiler would erase the pre-commitment signal the audit depends on.
+
+### Experiment-backed claims (#260)
+
+When a claim is backed by the scholar's OWN experiment (not a literature citation), emit an optional `planned_experiment_ids[]` array on that claim listing the `experiment_provenance[].experiment_id` values it relies on:
+
+```json
+{
+  "claim_id": "C-002",
+  "claim_text": "Removing head pruning raises macro-F1 by 4.2 points on the held-out set.",
+  "intended_evidence_kind": "empirical",
+  "planned_refs": [],
+  "planned_experiment_ids": ["exp-ablation-A"]
+}
+```
+
+- **R-CIM-D (experiment emission):** Emit `planned_experiment_ids` ONLY when an experiment in the passport's `experiment_provenance[]` backs the claim. It is **optional-absent** — omit it entirely on literature-only / definitional / theoretical / normative claims (never emit an empty array; `minItems` is 1). The values are passport-local `experiment_id`s frozen at Stage 1 intake — reference them exactly as the scholar entered them; do NOT invent ids or rename. A claim carrying `planned_experiment_ids` MUST have `intended_evidence_kind: "empirical"` (EP-INV-3); an experiment is a source of empirical evidence, not a new evidence kind (there is NO `experimental` value — D2). **Mixed evidence is allowed:** a claim may carry BOTH `planned_refs` (literature) AND `planned_experiment_ids` (own experiment) — both back the empirical claim, and the gate audits each path. You do NOT compute the experiment alignment verdict (that is the integrity gate's `experiment_alignment_results[]`, #260); you only pre-commit the join.

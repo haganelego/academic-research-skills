@@ -12,37 +12,49 @@ from __future__ import annotations
 import http.client
 import json
 import os
-import string
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from difflib import SequenceMatcher
 from typing import Any, Mapping
 
+# Dual-path import: sibling-first (so module identity matches when callers
+# import via the sibling path, e.g. tests), namespace-package fallback (for
+# repo-root `import scripts.openalex_client`). See semantic_scholar_client.py
+# for the identity-matching rationale.
+try:
+    from _text_similarity import (
+        _BACKOFF_SECONDS,
+        _MAX_RETRIES,
+        _TITLE_SIMILARITY_THRESHOLD,
+        _similarity,
+        exact_normalized_title,
+        generic_title,
+    )
+except ImportError:
+    from scripts._text_similarity import (
+        _BACKOFF_SECONDS,
+        _MAX_RETRIES,
+        _TITLE_SIMILARITY_THRESHOLD,
+        _similarity,
+        exact_normalized_title,
+        generic_title,
+    )
 
-_PUNCT_TRANSLATION = str.maketrans({c: " " for c in string.punctuation})
 
 _API_BASE = "https://api.openalex.org"
+_API_HOST = "api.openalex.org"
 _POLITE_EMAIL_ENV = "OPENALEX_POLITE_EMAIL"
 _FIELDS = "id,title,authorships,publication_year,doi,primary_location"
-
-_BACKOFF_SECONDS = 2.0
-_MAX_RETRIES = 3
 
 _POLITE_MIN_INTERVAL = 0.1
 _ANONYMOUS_MIN_INTERVAL = 1.0
 
-_TITLE_SIMILARITY_THRESHOLD = 0.70
 
-
-def _normalize_title(s: str) -> str:
-    cleaned = s.lower().translate(_PUNCT_TRANSLATION)
-    return " ".join(cleaned.split())
-
-
-def _similarity(a: str, b: str) -> float:
-    return SequenceMatcher(None, _normalize_title(a), _normalize_title(b)).ratio()
+def _require_api_url(url: str) -> None:
+    parsed = urllib.parse.urlsplit(url)
+    if parsed.scheme != "https" or parsed.netloc != _API_HOST:
+        raise OpenAlexUnavailable(f"Refusing non-OpenAlex URL: {url}")
 
 
 class OpenAlexUnavailable(Exception):
@@ -66,7 +78,11 @@ class OpenAlexClient:
     def _throttle(self) -> None:
         if self._last_request_at is None:
             return
-        elapsed = time.time() - self._last_request_at
+        # time.monotonic for elapsed measurement: NTP / manual clock
+        # adjustments can make time.time go backward, producing negative
+        # elapsed and either huge sleep or zero sleep (#128 §6). Aligns
+        # with semantic_scholar_client.py.
+        elapsed = time.monotonic() - self._last_request_at
         if elapsed < self._min_interval:
             time.sleep(self._min_interval - elapsed)
 
@@ -75,14 +91,16 @@ class OpenAlexClient:
         if self._polite_email:
             params["mailto"] = self._polite_email
         url = f"{_API_BASE}{path}?{urllib.parse.urlencode(params)}"
+        _require_api_url(url)
         req = urllib.request.Request(url, headers={"User-Agent": "ARS-v3.9.0"})
 
         self._throttle()
-        self._last_request_at = time.time()
+        self._last_request_at = time.monotonic()
 
         for attempt in range(_MAX_RETRIES + 1):
             try:
-                with urllib.request.urlopen(req, timeout=30) as resp:
+                # URL is fixed-host HTTPS after _require_api_url().
+                with urllib.request.urlopen(req, timeout=30) as resp:  # nosec B310
                     # Wrap response body read + decode + parse in a narrow
                     # except so transient socket drops mid-stream, garbled
                     # bodies, or HTML error pages slipped through with 200
@@ -115,7 +133,7 @@ class OpenAlexClient:
                     # paces against actual wake time, not entry time.
                     # Without this the next call may under-sleep (elapsed
                     # already counts the 2s × N backoff) and re-trigger 429.
-                    self._last_request_at = time.time()
+                    self._last_request_at = time.monotonic()
                     continue
                 raise OpenAlexUnavailable(f"OpenAlex HTTP {e.code}: {e.reason}") from e
             except (urllib.error.URLError, TimeoutError) as e:
@@ -127,18 +145,24 @@ class OpenAlexClient:
         self, doi: str, expected_title: str,
     ) -> dict[str, Any] | None:
         """DOI lookup with mandatory Levenshtein 0.70 title cross-check."""
-        data = self._get(f"/works/doi:{doi}", {"select": _FIELDS})
+        quoted_doi = urllib.parse.quote(doi, safe="")
+        data = self._get(f"/works/doi:{quoted_doi}", {"select": _FIELDS})
         title = data.get("title") or ""
         if _similarity(title, expected_title) >= _TITLE_SIMILARITY_THRESHOLD:
             return data
         return None  # DOI_MISMATCH
 
     def title_search(self, title: str, year: int | None = None) -> dict[str, Any] | None:
-        """Title search with 0.70 similarity threshold + matching-year tiebreaker.
+        """Title search under the #431 exact-title-or-bust gate.
 
-        When *year* is provided, candidates whose ``publication_year`` matches
-        get a +0.05 score bonus (mirroring S2 client ``_lookup_by_title``).
-        """
+        A candidate matches iff it clears the 0.70 ratio AND is an exact
+        normalized title match (§0.12.1); a non-exact high-ratio title is never
+        promoted on year/author alone. On the title-fallback path no ID can
+        corroborate, so an exact-but-generic title (§0.12.2) is not promoted.
+        Returns the best exact candidate, or None → resolver reduces the
+        title-keyed miss to `unresolvable`. See crossref_client.title_search."""
+        if generic_title(title):
+            return None
         data = self._get("/works", {
             "search": title,
             "per-page": "5",
@@ -147,8 +171,11 @@ class OpenAlexClient:
         candidates = data.get("results", [])
         scored = []
         for cand in candidates:
-            sim = _similarity(cand.get("title") or "", title)
+            cand_title = cand.get("title") or ""
+            sim = _similarity(cand_title, title)
             if sim < _TITLE_SIMILARITY_THRESHOLD:
+                continue
+            if not exact_normalized_title(title, cand_title):
                 continue
             year_match = year is not None and cand.get("publication_year") == year
             score = sim + (0.05 if year_match else 0.0)

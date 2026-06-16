@@ -17,40 +17,47 @@ from __future__ import annotations
 import http.client
 import json
 import os
-import string
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from difflib import SequenceMatcher
 from typing import Any, Mapping
 
+# Dual-path import: see openalex_client.py comment.
+try:
+    from _text_similarity import (
+        _BACKOFF_SECONDS,
+        _MAX_RETRIES,
+        _TITLE_SIMILARITY_THRESHOLD,
+        _similarity,
+        exact_normalized_title,
+        generic_title,
+    )
+except ImportError:
+    from scripts._text_similarity import (
+        _BACKOFF_SECONDS,
+        _MAX_RETRIES,
+        _TITLE_SIMILARITY_THRESHOLD,
+        _similarity,
+        exact_normalized_title,
+        generic_title,
+    )
 
-_PUNCT_TRANSLATION = str.maketrans({c: " " for c in string.punctuation})
 
 _API_BASE = "https://api.crossref.org"
+_API_HOST = "api.crossref.org"
 _POLITE_EMAIL_ENV = "CROSSREF_POLITE_EMAIL"
-
-_BACKOFF_SECONDS = 2.0
-_MAX_RETRIES = 3
 
 # Crossref polite pool: 10 req/s with mailto, ~5 req/s anonymous (per
 # Crossref live response headers: x-rate-limit-limit=10, interval=1s).
 _POLITE_MIN_INTERVAL = 0.1
 _ANONYMOUS_MIN_INTERVAL = 0.2
 
-_TITLE_SIMILARITY_THRESHOLD = 0.70
 
-
-def _normalize_title(s: str) -> str:
-    """Case-insensitive, punctuation-to-whitespace normalization. Matches
-    S2 / OpenAlex client to keep the threshold semantically aligned."""
-    cleaned = s.lower().translate(_PUNCT_TRANSLATION)
-    return " ".join(cleaned.split())
-
-
-def _similarity(a: str, b: str) -> float:
-    return SequenceMatcher(None, _normalize_title(a), _normalize_title(b)).ratio()
+def _require_api_url(url: str) -> None:
+    parsed = urllib.parse.urlsplit(url)
+    if parsed.scheme != "https" or parsed.netloc != _API_HOST:
+        raise CrossrefUnavailable(f"Refusing non-Crossref URL: {url}")
 
 
 def _extract_title(message_or_item: Mapping[str, Any]) -> str:
@@ -97,7 +104,11 @@ class CrossrefClient:
     def _throttle(self) -> None:
         if self._last_request_at is None:
             return
-        elapsed = time.time() - self._last_request_at
+        # time.monotonic for elapsed measurement: NTP / manual clock
+        # adjustments can make time.time go backward, producing negative
+        # elapsed and either huge sleep or zero sleep (#128 §6). Aligns
+        # with semantic_scholar_client.py.
+        elapsed = time.monotonic() - self._last_request_at
         if elapsed < self._min_interval:
             time.sleep(self._min_interval - elapsed)
 
@@ -105,14 +116,16 @@ class CrossrefClient:
         url = f"{_API_BASE}{path}"
         if query:
             url += "?" + urllib.parse.urlencode(query)
+        _require_api_url(url)
         req = urllib.request.Request(url, headers={"User-Agent": self._user_agent})
 
         self._throttle()
-        self._last_request_at = time.time()
+        self._last_request_at = time.monotonic()
 
         for attempt in range(_MAX_RETRIES + 1):
             try:
-                with urllib.request.urlopen(req, timeout=30) as resp:
+                # URL is fixed-host HTTPS after _require_api_url().
+                with urllib.request.urlopen(req, timeout=30) as resp:  # nosec B310
                     # Wrap response body read + decode + parse in a narrow
                     # except so transient socket drops mid-stream, garbled
                     # bodies, or HTML error pages slipped through with 200
@@ -144,7 +157,7 @@ class CrossrefClient:
                     # Refresh throttle anchor after backoff so the next outer
                     # _get call's _throttle() paces against actual wake time,
                     # not the original entry time (mirrors openalex_client.py).
-                    self._last_request_at = time.time()
+                    self._last_request_at = time.monotonic()
                     continue
                 raise CrossrefUnavailable(f"Crossref HTTP {e.code}: {e.reason}") from e
             except (urllib.error.URLError, TimeoutError) as e:
@@ -160,7 +173,7 @@ class CrossrefClient:
         Returns the `message` dict if DOI hit AND title cross-check passes;
         None on 404 (miss), DOI_MISMATCH, or network success but no match.
         """
-        data = self._get(f"/works/{doi}", {})
+        data = self._get(f"/works/{urllib.parse.quote(doi, safe='')}", {})
         if not data:  # 404 -> empty dict from _get
             return None
         message = data.get("message", {})
@@ -172,11 +185,21 @@ class CrossrefClient:
     def title_search(
         self, title: str, year: int | None = None,
     ) -> dict[str, Any] | None:
-        """Title search with 0.70 similarity threshold + matching-year tiebreaker.
+        """Title search under the #431 exact-title-or-bust gate.
 
-        Returns the best matching candidate dict from `message.items`,
-        or None if no candidate meets the threshold.
-        """
+        A candidate is a title match iff it clears the 0.70 ratio AND its title
+        is an exact normalized match (§0.12.1) — title similarity + year/author
+        can no longer alone promote a NON-exact title (that is the shared
+        signature of an author's own related-but-distinct works: a correction
+        and its original, Part I / Part II, a no-ordinal companion). A non-exact
+        high-ratio #1 no longer ends the search, so a correct exact #2 is
+        reachable (F3). On the title-fallback path no ID can corroborate (the
+        DOI was absent or already missed before falling through here), so an
+        exact-but-generic title (§0.12.2) is NOT promoted either. The loop
+        returns the best exact candidate, or None → the resolver reduces a
+        title-keyed miss to `unresolvable` (never a false `matched`)."""
+        if generic_title(title):
+            return None
         data = self._get("/works", {"query.title": title, "rows": "5"})
         candidates = data.get("message", {}).get("items", [])
         scored = []
@@ -184,6 +207,8 @@ class CrossrefClient:
             cand_title = _extract_title(cand)
             sim = _similarity(cand_title, title)
             if sim < _TITLE_SIMILARITY_THRESHOLD:
+                continue
+            if not exact_normalized_title(title, cand_title):
                 continue
             year_match = year is not None and _extract_year(cand) == year
             score = sim + (0.05 if year_match else 0.0)

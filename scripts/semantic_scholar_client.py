@@ -15,28 +15,45 @@ tool can switch over without code changes.
 from __future__ import annotations
 
 import os
-import string
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from difflib import SequenceMatcher
 from typing import Any, Mapping
 
-from contamination_signals import SemanticScholarUnavailable
-
-
-_PUNCT_TRANSLATION = str.maketrans({c: " " for c in string.punctuation})
+# Dual-path import: try sibling-style first (scripts/-on-sys.path, used by
+# tests and direct CLI invocation) so module identity matches when callers
+# import via the sibling path. Fall back to `scripts.<module>` (namespace
+# package style, repo-root PYTHONPATH). Same pattern as scripts/slr_lineage.py.
+try:
+    from _text_similarity import (
+        _BACKOFF_SECONDS,
+        _MAX_RETRIES,
+        _TITLE_SIMILARITY_THRESHOLD,
+        _normalize_title,
+        _similarity,
+        exact_normalized_title,
+        generic_title,
+    )
+    from contamination_signals import SemanticScholarUnavailable
+except ImportError:
+    from scripts._text_similarity import (
+        _BACKOFF_SECONDS,
+        _MAX_RETRIES,
+        _TITLE_SIMILARITY_THRESHOLD,
+        _normalize_title,
+        _similarity,
+        exact_normalized_title,
+        generic_title,
+    )
+    from scripts.contamination_signals import SemanticScholarUnavailable
 
 
 # Per protocol: api.semanticscholar.org/graph/v1, 1 req/s unauthenticated.
 _API_BASE = "https://api.semanticscholar.org/graph/v1"
+_API_HOST = "api.semanticscholar.org"
 _API_KEY_ENV = "S2_API_KEY"
 _FIELDS = "title,authors,year,externalIds,venue,publicationDate"
-
-# Per protocol: 429 → 2s backoff × 3 retries.
-_BACKOFF_SECONDS = 2.0
-_MAX_RETRIES = 3
 
 # Per protocol line 6: unauthenticated tier is ~1 req/s, authenticated
 # (S2_API_KEY) tier is 10 req/s. Default throttle interval defends
@@ -44,23 +61,11 @@ _MAX_RETRIES = 3
 _UNAUTHENTICATED_MIN_INTERVAL = 1.0
 _AUTHENTICATED_MIN_INTERVAL = 0.1
 
-# Per PaperOrchestra (Song et al. 2026 Appx D.3) + protocol §"Query
-# Patterns" Pattern 1: title-similarity threshold for "matched" verdict.
-_TITLE_SIMILARITY_THRESHOLD = 0.70
 
-
-def _normalize_title(s: str) -> str:
-    """Per protocol §"Query Patterns" Pattern 1: 'case-insensitive,
-    stripped of punctuation' before computing similarity. Punctuation
-    becomes whitespace so token boundaries are preserved, then collapse
-    runs of whitespace. Codex R4-1 closure: raw lowercased comparison
-    falsely scored 'R.A.G.' vs 'RAG' below the 0.70 threshold."""
-    cleaned = s.lower().translate(_PUNCT_TRANSLATION)
-    return " ".join(cleaned.split())
-
-
-def _similarity(a: str, b: str) -> float:
-    return SequenceMatcher(None, _normalize_title(a), _normalize_title(b)).ratio()
+def _require_api_url(url: str) -> None:
+    parsed = urllib.parse.urlsplit(url)
+    if parsed.scheme != "https" or parsed.netloc != _API_HOST:
+        raise SemanticScholarUnavailable(f"Refusing non-S2 URL: {url}")
 
 
 class SemanticScholarClient:
@@ -176,6 +181,7 @@ class SemanticScholarClient:
         self._last_request_at = self._clock()
 
         url = f"{_API_BASE}{path}"
+        _require_api_url(url)
         headers = {"User-Agent": "ARS-migration/1.0"}
         if self._api_key:
             headers["x-api-key"] = self._api_key
@@ -183,7 +189,8 @@ class SemanticScholarClient:
 
         for attempt in range(_MAX_RETRIES + 1):
             try:
-                with urllib.request.urlopen(req, timeout=30) as resp:
+                # URL is fixed-host HTTPS after _require_api_url().
+                with urllib.request.urlopen(req, timeout=30) as resp:  # nosec B310
                     import json
                     return json.loads(resp.read().decode("utf-8"))
             except urllib.error.HTTPError as e:
@@ -235,7 +242,9 @@ class SemanticScholarClient:
         raise SemanticScholarUnavailable(f"S2 API exhausted {_MAX_RETRIES} retries")
 
     def _lookup_by_doi(self, doi: str, expected_title: str) -> dict[str, Any]:
-        data = self._request(f"/paper/DOI:{urllib.parse.quote(doi)}?fields={_FIELDS}")
+        data = self._request(
+            f"/paper/DOI:{urllib.parse.quote(doi, safe='')}?fields={_FIELDS}"
+        )
         if not data or not data.get("paperId"):
             return {"matched": False, "paperId": None}
         # Per protocol: cross-check title; DOI_MISMATCH counts as no-match
@@ -246,6 +255,18 @@ class SemanticScholarClient:
         return {"matched": True, "paperId": data["paperId"]}
 
     def _lookup_by_title(self, title: str, year: int | None) -> dict[str, Any]:
+        """Title search under the #431 exact-title-or-bust gate.
+
+        A candidate matches iff it clears the 0.70 ratio AND is an exact
+        normalized title match (§0.12.1); the candidate dict must be inspected
+        for its title here (the pre-#431 version discarded it, keeping only
+        paperId, so it could not apply the exact gate). A non-exact high-ratio
+        title is never promoted on year alone. On the title-fallback path no ID
+        corroborates, so an exact-but-generic title (§0.12.2) is not promoted.
+        A no-exact loop returns no match → the resolver reduces the title-keyed
+        miss to `unresolvable` (never a false `matched`)."""
+        if generic_title(title):
+            return {"matched": False, "paperId": None}
         path = (
             f"/paper/search?query={urllib.parse.quote(title)}"
             f"&limit=5&fields={_FIELDS}"
@@ -254,8 +275,11 @@ class SemanticScholarClient:
         candidates = data.get("data") or []
         best: tuple[float, dict[str, Any]] | None = None
         for cand in candidates:
-            sim = _similarity(title, cand.get("title") or "")
+            cand_title = cand.get("title") or ""
+            sim = _similarity(title, cand_title)
             if sim < _TITLE_SIMILARITY_THRESHOLD:
+                continue
+            if not exact_normalized_title(title, cand_title):
                 continue
             # Per protocol: prefer matching year when multiple ≥0.70 results.
             year_match = year is not None and cand.get("year") == year
